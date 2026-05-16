@@ -7,7 +7,7 @@ Runs Scout Agent automatically at scheduled times
 import time
 import threading
 import logging
-from datetime import datetime, time as dt_time
+from datetime import datetime, timedelta, time as dt_time
 from typing import Optional, Callable
 
 import streamlit as st
