@@ -1,0 +1,32 @@
+# ── SECURITY — yeh kabhi GitHub pe mat jayen ──
+.env
+serviceAccountKey.json
+*_credentials.json
+*.pem
+
+# ── Python ──────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── ChromaDB local data ──────────────────────
+chroma_db/
+
+# ── Generated CV files ───────────────────────
+generated_cvs/
+*.docx
+*.pdf
+
+# ── OS files ─────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ──────────────────────────────────────
+.vscode/
+.idea/
+*.swp
