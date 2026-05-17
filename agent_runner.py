@@ -32,9 +32,23 @@ CYCLE_HOURS      = int(os.getenv("AGENT_CYCLE_HOURS", "6"))
 AUTO_APPLY_THRESHOLD  = int(os.getenv("AUTO_APPLY_SCORE", "75"))
 ASK_THRESHOLD         = int(os.getenv("ASK_SCORE", "55"))
 
-# ── Telegram ──────────────────────────────────────────────────
+# Startup pe variables ka status print karo
+print("=" * 50)
+print("🔧 JOBPILOT AGENT STARTING...")
+print(f"   TELEGRAM_TOKEN present: {'YES' if TELEGRAM_TOKEN else 'NO'}")
+print(f"   TELEGRAM_CHAT_ID present: {'YES' if TELEGRAM_CHAT_ID else 'NO'}")
+print(f"   CYCLE_HOURS: {CYCLE_HOURS}")
+print(f"   AUTO_APPLY_THRESHOLD: {AUTO_APPLY_THRESHOLD}")
+print(f"   ASK_THRESHOLD: {ASK_THRESHOLD}")
+print("=" * 50)
+
+# ── Telegram (with FULL debugging) ────────────────────────────
 def send_telegram(text, buttons=None):
-    """Hassan ko Telegram pe message bhejo"""
+    """Hassan ko Telegram pe message bhejo - with full debug output"""
+    print(f"\n📨 [DEBUG] send_telegram called")
+    print(f"   TELEGRAM_TOKEN: {'[SET]' if TELEGRAM_TOKEN else '[MISSING]'}")
+    print(f"   TELEGRAM_CHAT_ID: {'[SET]' if TELEGRAM_CHAT_ID else '[MISSING]'}")
+    
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured — skipping notification")
         print("❌ TELEGRAM_BOT_TOKEN or CHAT_ID missing")
@@ -54,12 +68,30 @@ def send_telegram(text, buttons=None):
             ]
         }
     
+    print(f"   URL: {url[:50]}...")
+    print(f"   Chat ID: {TELEGRAM_CHAT_ID}")
+    print(f"   Text preview: {text[:100]}...")
+    
     try:
         r = requests.post(url, json=data, timeout=10)
-        return r.status_code == 200
+        print(f"   📡 HTTP Status Code: {r.status_code}")
+        print(f"   📡 Response Body: {r.text[:300]}")
+        
+        if r.status_code == 200:
+            print("   ✅ Telegram message sent successfully!")
+            return True
+        else:
+            # Ye important hai — non-200 status pe error log
+            log.error(f"Telegram API error {r.status_code}: {r.text}")
+            print(f"   ❌ Telegram API returned error {r.status_code}: {r.text}")
+            return False
+    except requests.exceptions.Timeout:
+        print("   ❌ Telegram request TIMEOUT")
+        log.error("Telegram request timeout")
+        return False
     except Exception as e:
+        print(f"   ❌ Telegram exception: {type(e).__name__}: {e}")
         log.error(f"Telegram error: {e}")
-        print(f"❌ Telegram error: {e}")
         return False
 
 def answer_callback(callback_id, text="✅"):
@@ -70,8 +102,9 @@ def answer_callback(callback_id, text="✅"):
             json={"callback_query_id": callback_id, "text": text},
             timeout=5
         )
-    except:
-        pass
+        print(f"   [DEBUG] Callback answer sent: {text}")
+    except Exception as e:
+        print(f"   [DEBUG] Callback answer failed: {e}")
 
 # ── Firebase ──────────────────────────────────────────────────
 def get_firebase_db():
@@ -89,6 +122,7 @@ def get_firebase_db():
     
     # \n ko actual newlines mein convert karo
     private_key = private_key.replace("\\n", "\n")
+    print("   [DEBUG] Firebase private key loaded, length:", len(private_key))
     
     cred_dict = {
         "type":                        "service_account",
@@ -417,6 +451,7 @@ def listen_telegram(db):
     """Hassan ke Yes/No replies sunna"""
     last_update_id = 0
     log.info("👂 Telegram listener started")
+    print("[DEBUG] Telegram listener thread is running...")
     
     while True:
         try:
@@ -425,6 +460,7 @@ def listen_telegram(db):
             resp   = requests.get(url, params=params, timeout=35)
             
             if resp.status_code != 200:
+                print(f"[DEBUG] getUpdates returned {resp.status_code}")
                 time.sleep(5)
                 continue
             
@@ -439,6 +475,7 @@ def listen_telegram(db):
                 
                 cb_data  = callback.get("data", "")
                 cb_id    = callback.get("id")
+                print(f"[DEBUG] Received callback: {cb_data}")
                 
                 if cb_data.startswith("approve_"):
                     job_id = cb_data.replace("approve_", "")
@@ -454,6 +491,7 @@ def listen_telegram(db):
             pass  # Normal — long polling timeout
         except Exception as e:
             log.error(f"Telegram listener error: {e}")
+            print(f"[DEBUG] Listener exception: {e}")
             time.sleep(5)
 
 def handle_approval(db, job_id, approved):
@@ -482,6 +520,7 @@ def handle_approval(db, job_id, approved):
 
 # ── MAIN ──────────────────────────────────────────────────────
 if __name__ == "__main__":
+    print("\n🚀 JOBPILOT AGENT MAIN ENTRY POINT")
     log.info("🚀 JobPilot Agent Runner Starting...")
     log.info(f"   Cycle: every {CYCLE_HOURS} hours")
     log.info(f"   Auto-apply threshold: {AUTO_APPLY_THRESHOLD}%")
@@ -489,28 +528,40 @@ if __name__ == "__main__":
     
     # Firebase connect karo
     try:
+        print("[DEBUG] Connecting to Firebase...")
         db = get_firebase_db()
+        print("[DEBUG] Firebase connected successfully")
     except Exception as e:
         log.error(f"Firebase connection failed: {e}")
+        print(f"[DEBUG] Firebase FATAL: {e}")
         exit(1)
     
     # Telegram listener background mein shuru karo
     import threading
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        print("[DEBUG] Starting Telegram listener thread...")
         t = threading.Thread(target=listen_telegram, args=(db,), daemon=True)
         t.start()
+        print("[DEBUG] Telegram listener thread started")
+    else:
+        print("[DEBUG] Telegram not configured — listener not started")
     
     # Startup notification
-    send_telegram(
+    print("[DEBUG] Sending startup message via Telegram...")
+    result = send_telegram(
         "🚀 <b>JobPilot Agent Started!</b>\n\n"
         f"✅ Firebase: Connected\n"
         f"🔄 Cycle: Har {CYCLE_HOURS} ghante\n"
         f"📊 Auto-apply: {AUTO_APPLY_THRESHOLD}%+ match\n\n"
         "So jao — main kaam kar raha hoon! 😴"
     )
+    print(f"[DEBUG] Startup message send result: {result}")
     
     # Main autonomous loop
+    cycle_count = 0
     while True:
+        cycle_count += 1
+        print(f"\n[DEBUG] Starting cycle #{cycle_count}")
         try:
             run_agent_cycle(db)
         except Exception as e:
@@ -518,4 +569,5 @@ if __name__ == "__main__":
             send_telegram(f"⚠️ Agent error:\n{str(e)[:200]}")
         
         log.info(f"💤 Sleeping {CYCLE_HOURS} hours...")
+        print(f"[DEBUG] Sleeping for {CYCLE_HOURS} hours until next cycle")
         time.sleep(CYCLE_HOURS * 3600)
