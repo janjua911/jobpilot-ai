@@ -31,4 +31,12 @@ python-telegram-bot==21.3
 
 # ── Utilities ───────────────────────────────
 python-dotenv==1.0.1      # .env file read karne ke liye
-pydantic==2.7.4           # Data validation
+pydantic>=2.10.0            # Data validation
+
+
+
+
+
+
+
+
