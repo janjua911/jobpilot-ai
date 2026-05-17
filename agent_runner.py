@@ -37,6 +37,7 @@ def send_telegram(text, buttons=None):
     """Hassan ko Telegram pe message bhejo"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured — skipping notification")
+        print("❌ TELEGRAM_BOT_TOKEN or CHAT_ID missing")
         return False
     
     url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -58,6 +59,7 @@ def send_telegram(text, buttons=None):
         return r.status_code == 200
     except Exception as e:
         log.error(f"Telegram error: {e}")
+        print(f"❌ Telegram error: {e}")
         return False
 
 def answer_callback(callback_id, text="✅"):
