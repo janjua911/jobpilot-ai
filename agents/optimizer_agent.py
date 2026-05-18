@@ -7,7 +7,7 @@ FIXED:
   - Groq primary, Gemini fallback (same as analyzer_agent)
   - NO top-level `import streamlit as st` — won't crash agent_runner
   - Streamlit imports only inside show_optimizer_ui() (dashboard only)
-  - optimize_cv_for_job() method intact (agent_runner calls this)
+  - Added auto-fallback on Groq errors
 """
 
 import os
@@ -29,22 +29,33 @@ class OptimizerAgent:
 
     def __init__(self, api_key: str = None):
         self.use_groq = USE_GROQ
+        self.gemini_fallback_initialized = False
 
         if self.use_groq:
             from groq import Groq
             self.groq_client = Groq(api_key=GROQ_API_KEY)
-            self.groq_model  = "llama-3.3-70b-versatile"
+            self.groq_model = "llama-3.3-70b-versatile"
             logger.info("OptimizerAgent using Groq API")
 
         elif GEMINI_API_KEY or api_key:
-            import google.generativeai as genai
-            genai.configure(api_key=api_key or GEMINI_API_KEY)
-            self.gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+            self._init_gemini(api_key)
+            self.use_groq = False
             logger.info("OptimizerAgent using Gemini API (fallback)")
 
         else:
             logger.error("No API key found for OptimizerAgent!")
-            self.use_groq = False
+
+    def _init_gemini(self, api_key=None):
+        """Initialize Gemini client (lazy loading)"""
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=api_key or GEMINI_API_KEY)
+            self.gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+            self.gemini_fallback_initialized = True
+            logger.info("Gemini client initialized for optimizer fallback")
+        except Exception as e:
+            logger.error(f"Failed to initialize Gemini: {e}")
+            self.gemini_fallback_initialized = False
 
     # ── Public Method (called by agent_runner + dashboard) ────
 
@@ -57,9 +68,9 @@ class OptimizerAgent:
         candidate_name: str = "Candidate"
     ) -> Dict:
 
-        keywords      = self._extract_keywords(jd_text)
-        optimized_cv  = self._rewrite_cv(cv_text, jd_text, keywords)
-        cover_letter  = self._generate_cover_letter(
+        keywords = self._extract_keywords(jd_text)
+        optimized_cv = self._rewrite_cv(cv_text, jd_text, keywords)
+        cover_letter = self._generate_cover_letter(
             candidate_name, job_title, company_name, jd_text, cv_text
         )
 
@@ -71,31 +82,40 @@ class OptimizerAgent:
             docx_bytes = None
 
         return {
-            "cv_docx":           docx_bytes,
-            "cv_text":           optimized_cv,
-            "cover_letter":      cover_letter,
+            "cv_docx": docx_bytes,
+            "cv_text": optimized_cv,
+            "cover_letter": cover_letter,
             "improvement_score": self._calculate_improvement(cv_text, optimized_cv, keywords),
             "keywords_injected": keywords[:10]
         }
 
-    # ── LLM Calls ─────────────────────────────────────────────
+    # ── LLM Calls (WITH AUTO-FALLBACK) ────────────────────────
 
     def _call_llm(self, prompt: str, max_tokens: int = 1000) -> str:
+        """Call LLM with auto-fallback from Groq to Gemini"""
         if self.use_groq:
-            return self._call_groq(prompt, max_tokens)
+            try:
+                return self._call_groq(prompt, max_tokens)
+            except Exception as groq_error:
+                logger.warning(f"Groq failed, switching to Gemini: {groq_error}")
+                if GEMINI_API_KEY:
+                    if not self.gemini_fallback_initialized:
+                        self._init_gemini()
+                    return self._call_gemini(prompt, max_tokens)
+                raise
         else:
             return self._call_gemini(prompt, max_tokens)
 
     def _call_groq(self, prompt: str, max_tokens: int = 1000) -> str:
         try:
             response = self.groq_client.chat.completions.create(
-                model    = self.groq_model,
-                messages = [
+                model=self.groq_model,
+                messages=[
                     {"role": "system", "content": "You are an expert CV writer and career coach."},
-                    {"role": "user",   "content": prompt}
+                    {"role": "user", "content": prompt}
                 ],
-                max_tokens  = max_tokens,
-                temperature = 0.4
+                max_tokens=max_tokens,
+                temperature=0.4
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -238,10 +258,10 @@ Sincerely,
 
         # Margins
         for section in doc.sections:
-            section.top_margin    = Inches(0.5)
+            section.top_margin = Inches(0.5)
             section.bottom_margin = Inches(0.5)
-            section.left_margin   = Inches(0.75)
-            section.right_margin  = Inches(0.75)
+            section.left_margin = Inches(0.75)
+            section.right_margin = Inches(0.75)
 
         display_name = name if (name and name != "Candidate") else "Candidate"
 
@@ -272,8 +292,8 @@ Sincerely,
 
     def _calculate_improvement(self, original: str, optimized: str, keywords: List[str]) -> int:
         orig_lower = original.lower()
-        opt_lower  = optimized.lower()
-        new_kw     = [k for k in keywords if k.lower() in opt_lower and k.lower() not in orig_lower]
+        opt_lower = optimized.lower()
+        new_kw = [k for k in keywords if k.lower() in opt_lower and k.lower() not in orig_lower]
         return min(100, int((len(new_kw) / max(len(keywords), 1)) * 100))
 
 
@@ -299,11 +319,11 @@ def show_optimizer_ui(job: Dict, db):
             with st.spinner("🤖 Generating tailored CV and cover letter... (10-15 seconds)"):
                 optimizer = OptimizerAgent()
                 result = optimizer.optimize_cv_for_job(
-                    cv_text        = cv_text,
-                    jd_text        = job.get("description", ""),
-                    job_title      = job.get("title", ""),
-                    company_name   = job.get("company", ""),
-                    candidate_name = st.session_state.get("user_name", "Candidate")
+                    cv_text=cv_text,
+                    jd_text=job.get("description", ""),
+                    job_title=job.get("title", ""),
+                    company_name=job.get("company", ""),
+                    candidate_name=st.session_state.get("user_name", "Candidate")
                 )
                 st.session_state[f"optimized_cv_{job['id']}"] = result
                 st.success(f"✅ CV optimized! {result['improvement_score']}% improvement")
@@ -317,11 +337,11 @@ def show_optimizer_ui(job: Dict, db):
                 f"{job.get('company', 'Job')}_{job.get('title', 'Role')}_CV.docx"
             )
             st.download_button(
-                label     = "⬇️ Download Tailored CV (DOCX)",
-                data      = result["cv_docx"],
-                file_name = filename,
-                mime      = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key       = f"download_{job['id']}"
+                label="⬇️ Download Tailored CV (DOCX)",
+                data=result["cv_docx"],
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key=f"download_{job['id']}"
             )
 
     result = st.session_state.get(f"optimized_cv_{job['id']}")
@@ -331,11 +351,11 @@ def show_optimizer_ui(job: Dict, db):
 
         cover_text = result.get("cover_letter", "No cover letter generated")
         st.text_area(
-            label             = "Cover Letter",
-            value             = cover_text,
-            height            = 400,
-            key               = f"cover_{job['id']}",
-            label_visibility  = "collapsed"
+            label="Cover Letter",
+            value=cover_text,
+            height=400,
+            key=f"cover_{job['id']}",
+            label_visibility="collapsed"
         )
 
         word_count = len(cover_text.split())
