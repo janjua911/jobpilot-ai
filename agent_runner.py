@@ -460,6 +460,7 @@ def run_agent_cycle(db):
             continue
 
         analysis = analyze_job(job, cv_text)
+        time.sleep(2)
         score    = analysis.get("match_score", 0)
 
         job["match_score"]    = score
