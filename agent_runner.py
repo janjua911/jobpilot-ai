@@ -81,7 +81,6 @@ def send_telegram(text, buttons=None):
             print("   ✅ Telegram message sent successfully!")
             return True
         else:
-            # Ye important hai — non-200 status pe error log
             log.error(f"Telegram API error {r.status_code}: {r.text}")
             print(f"   ❌ Telegram API returned error {r.status_code}: {r.text}")
             return False
@@ -115,12 +114,10 @@ def get_firebase_db():
     if firebase_admin._apps:
         return firestore.client()
     
-    # Environment variables se credentials lo
     private_key = os.getenv("FIREBASE_PRIVATE_KEY", "")
     if not private_key:
         raise ValueError("FIREBASE_PRIVATE_KEY not set in Railway Variables!")
     
-    # \n ko actual newlines mein convert karo
     private_key = private_key.replace("\\n", "\n")
     print("   [DEBUG] Firebase private key loaded, length:", len(private_key))
     
@@ -142,25 +139,64 @@ def get_firebase_db():
     log.info("✅ Firebase connected")
     return firestore.client()
 
+# ═══════════════════════════════════════════════════════════════
+# 🔧 FIXED: get_user_profile() - Now checks BOTH collections
+# ═══════════════════════════════════════════════════════════════
 def get_user_profile(db):
-    """Hassan ka CV aur preferences Firebase se padho"""
+    """CV aur preferences Firebase se padho - FIXED: Checks both collections"""
     try:
-        docs = db.collection("user_profiles").limit(1).get()
-        for doc in docs:
+        # ✅ FIRST: Check users collection (where Streamlit app saves CV)
+        users_docs = db.collection("users").limit(1).stream()
+        for doc in users_docs:
             profile = doc.to_dict()
-            log.info(f"Profile loaded: {profile.get('email', 'unknown')}")
-            return profile
+            cv_text = profile.get("cv_text", "")
+            if cv_text:
+                log.info(f"✅ CV found in 'users' collection! Length: {len(cv_text)} chars")
+                return {
+                    "cv_text": cv_text,
+                    "name": profile.get("name", "Hassan Afzal"),
+                    "email": profile.get("email", ""),
+                    "target_roles": profile.get("preferences", {}).get("target_roles", 
+                                ["Machine Learning Engineer", "AI Engineer"]),
+                    "locations": profile.get("preferences", {}).get("locations", ["Remote"]),
+                    "work_type": profile.get("preferences", {}).get("work_type", ["Full-time"])
+                }
         
-        # Fallback: session data try karo
+        # ✅ SECOND: Check user_profiles (backward compatibility)
+        profile_docs = db.collection("user_profiles").limit(1).stream()
+        for doc in profile_docs:
+            profile = doc.to_dict()
+            cv_text = profile.get("cv_text", "")
+            if cv_text:
+                log.info(f"✅ CV found in 'user_profiles' collection! Length: {len(cv_text)} chars")
+                return profile
+        
+        # ❌ No CV found anywhere
+        log.warning("❌ No CV found in ANY Firebase collection!")
+        
+        # Debug: List all available collections
+        try:
+            collections = db.collections()
+            log.info("📁 Available Firebase collections:")
+            for coll in collections:
+                doc_count = len(list(coll.limit(1).stream()))
+                log.info(f"  - {coll.id} ({doc_count} documents)")
+        except Exception as debug_err:
+            log.warning(f"Could not list collections: {debug_err}")
+        
+        # Fallback: Check session data (for backward compatibility)
         session_doc = db.collection("sessions").document("main").get()
         if session_doc.exists:
-            return session_doc.to_dict()
+            session_data = session_doc.to_dict()
+            if session_data.get("cv_text"):
+                log.info("✅ CV found in 'sessions' collection!")
+                return session_data
         
-        log.warning("No user profile found in Firebase")
-        return {}
+        return {"cv_text": ""}  # Return empty dict if nothing found
+        
     except Exception as e:
         log.error(f"Profile fetch error: {e}")
-        return {}
+        return {"cv_text": ""}
 
 def save_job(db, job):
     """Job Firebase mein save karo"""
@@ -245,7 +281,6 @@ def detect_apply_email(job):
     """JD mein email dhundo"""
     description = job.get("description", "") + " " + job.get("apply_url", "")
     emails = re.findall(r'[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}', description)
-    # Common HR emails filter karo
     for email in emails:
         if not any(x in email.lower() for x in ["example", "test", "noreply"]):
             return email
@@ -296,7 +331,6 @@ def optimize_and_apply(db, job, cv_text, profile):
     try:
         from agents.optimizer_agent import OptimizerAgent
         
-        # CV tailor karo
         optimizer = OptimizerAgent()
         result    = optimizer.optimize(
             cv_text      = cv_text,
@@ -306,8 +340,6 @@ def optimize_and_apply(db, job, cv_text, profile):
         )
         
         cover_letter = result.get("cover_letter", "Please find my application attached.")
-        
-        # Email detect karo
         apply_email = detect_apply_email(job)
         
         if apply_email:
@@ -320,7 +352,6 @@ def optimize_and_apply(db, job, cv_text, profile):
             )
             apply_method = f"email → {apply_email}"
         else:
-            # Email nahi mila — Telegram pe link bhejo
             send_telegram(
                 f"📋 <b>Apply karna hai (manual)</b>\n\n"
                 f"🏢 {job.get('company')}\n"
@@ -331,7 +362,6 @@ def optimize_and_apply(db, job, cv_text, profile):
             success      = False
             apply_method = "manual_required"
         
-        # Application log karo
         save_application(db, {
             "job_id":       job.get("id"),
             "company":      job.get("company"),
@@ -360,13 +390,21 @@ def run_agent_cycle(db):
     cv_text = profile.get("cv_text", "")
     
     if not cv_text:
-        log.warning("No CV found — skipping cycle")
+        log.warning("⚠️ No CV found — skipping cycle")
         send_telegram(
             "⚠️ <b>JobPilot Alert</b>\n\n"
-            "CV Firebase mein nahi mili!\n"
-            "App → Settings → CV upload karo"
+            "❌ CV Firebase mein nahi mili!\n\n"
+            "Solution:\n"
+            "1. Open Streamlit App\n"
+            "2. Settings → CV Upload\n"
+            "3. Upload your CV again\n\n"
+            "Agent will retry in 1 hour..."
         )
+        # Short sleep instead of full cycle
+        time.sleep(3600)
         return
+    
+    log.info(f"✅ CV loaded successfully! Length: {len(cv_text)} chars")
     
     # Step 2: Jobs dhundo
     jobs = scout_jobs(profile)
@@ -374,16 +412,17 @@ def run_agent_cycle(db):
         log.info("No new jobs found this cycle")
         return
     
+    log.info(f"📊 Processing {len(jobs)} jobs...")
+    
     # Step 3: Har job analyze karo
     auto_applied   = 0
     needs_approval = []
     low_match      = 0
     
     for job in jobs:
-        # Firebase mein check — already processed?
         existing = db.collection("jobs").document(str(job.get("id", ""))).get()
         if existing.exists and existing.to_dict().get("status"):
-            log.info(f"  Already processed: {job.get('company')} — skipping")
+            log.info(f"  ⏭️ Already processed: {job.get('company')}")
             continue
         
         analysis = analyze_job(job, cv_text)
@@ -395,11 +434,9 @@ def run_agent_cycle(db):
         job["status"]         = "analyzed"
         
         save_job(db, job)
-        log.info(f"  {job.get('company')} — {job.get('title')} — {score}%")
+        log.info(f"  📊 {job.get('company')} — {job.get('title')} — {score}%")
         
-        # Decision
         if score >= AUTO_APPLY_THRESHOLD:
-            # Auto apply
             success = optimize_and_apply(db, job, cv_text, profile)
             if success:
                 auto_applied += 1
@@ -419,8 +456,8 @@ def run_agent_cycle(db):
             low_match += 1
             mark_job_status(db, job.get("id"), "skipped_low_match")
     
-    # Step 4: Medium match jobs ke liye Hassan se pucho
-    for job in needs_approval[:3]:  # Max 3 per cycle
+    # Step 4: Medium match jobs ke liye pucho
+    for job in needs_approval[:3]:
         send_telegram(
             f"🤔 <b>Apply karna chahiye?</b>\n\n"
             f"🏢 {job.get('company')}\n"
@@ -435,7 +472,7 @@ def run_agent_cycle(db):
         time.sleep(1)
     
     # Step 5: Summary
-    log.info(f"Cycle complete — Auto: {auto_applied} | Pending: {len(needs_approval)} | Low: {low_match}")
+    log.info(f"✅ Cycle complete — Auto: {auto_applied} | Pending: {len(needs_approval)} | Low: {low_match}")
     
     if auto_applied > 0 or needs_approval:
         send_telegram(
@@ -448,16 +485,37 @@ def run_agent_cycle(db):
 
 # ── Telegram Approval Listener ────────────────────────────────
 def listen_telegram(db):
-    """Hassan ke Yes/No replies sunna"""
+    """Hassan ke Yes/No replies sunna - FIXED for 409 errors"""
     last_update_id = 0
+    consecutive_errors = 0
     log.info("👂 Telegram listener started")
     print("[DEBUG] Telegram listener thread is running...")
     
     while True:
         try:
-            url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-            params = {"timeout": 30, "offset": last_update_id + 1, "allowed_updates": ["callback_query"]}
-            resp   = requests.get(url, params=params, timeout=35)
+            # ✅ FIX: Add offset and limit to prevent conflicts
+            offset = last_update_id + 1 if last_update_id else 0
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            params = {
+                "timeout": 25,  # Reduced from 30
+                "offset": offset,
+                "limit": 1,  # Limit to 1 update at a time
+                "allowed_updates": ["callback_query"]
+            }
+            resp = requests.get(url, params=params, timeout=30)
+            
+            if resp.status_code == 409:
+                consecutive_errors += 1
+                if consecutive_errors > 3:
+                    log.warning(f"Telegram 409 error repeated {consecutive_errors} times, resetting...")
+                    time.sleep(30)
+                    consecutive_errors = 0
+                else:
+                    time.sleep(5)
+                continue
+            
+            consecutive_errors = 0  # Reset on success
             
             if resp.status_code != 200:
                 print(f"[DEBUG] getUpdates returned {resp.status_code}")
@@ -468,13 +526,13 @@ def listen_telegram(db):
             
             for update in updates:
                 last_update_id = update["update_id"]
-                callback       = update.get("callback_query")
+                callback = update.get("callback_query")
                 
                 if not callback:
                     continue
                 
-                cb_data  = callback.get("data", "")
-                cb_id    = callback.get("id")
+                cb_data = callback.get("data", "")
+                cb_id = callback.get("id")
                 print(f"[DEBUG] Received callback: {cb_data}")
                 
                 if cb_data.startswith("approve_"):
@@ -488,11 +546,11 @@ def listen_telegram(db):
                     handle_approval(db, job_id, approved=False)
         
         except requests.exceptions.Timeout:
-            pass  # Normal — long polling timeout
+            pass  # Normal timeout, continue
         except Exception as e:
             log.error(f"Telegram listener error: {e}")
             print(f"[DEBUG] Listener exception: {e}")
-            time.sleep(5)
+            time.sleep(10)
 
 def handle_approval(db, job_id, approved):
     """Hassan ki approval handle karo"""
