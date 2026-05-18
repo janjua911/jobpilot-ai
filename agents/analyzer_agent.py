@@ -18,6 +18,16 @@ from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 
+# ═══════════════════════════════════════════════════════════════
+# 🔧 DEBUG CODE - Railway environment variables check
+# ═══════════════════════════════════════════════════════════════
+print("=" * 60)
+print("🚨 [RAILWAY DEBUG] Environment Variables Check")
+print(f"GROQ_API_KEY exists: {'YES' if os.getenv('GROQ_API_KEY') else 'NO'}")
+print(f"GROQ_API_KEY value: {os.getenv('GROQ_API_KEY', 'MISSING')[:20] if os.getenv('GROQ_API_KEY') else 'NOT SET'}...")
+print(f"GEMINI_API_KEY exists: {'YES' if os.getenv('GEMINI_API_KEY') else 'NO'}")
+print("=" * 60)
+
 # Initialize API preferences
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
