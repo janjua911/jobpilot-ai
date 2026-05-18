@@ -10,7 +10,7 @@ def auto_scout_job():
     """Stub — actual work agent_runner.py karta hai Railway pe"""
     logger.info(f"Manual scout triggered at {datetime.now()}")
     return []
-
+ 
 def init_auto_scheduler():
     pass
 
