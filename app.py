@@ -53,12 +53,18 @@ def test_scheduler():
         except Exception as e:
             print(f"[ERROR] Auto-scout failed: {e}")
 
-# Start test scheduler on app load (only once)
+# ═══════════════════════════════════════════════════════════════
+# 🔧 FIXED: Start test scheduler only if NOT disabled via env var
+# ═══════════════════════════════════════════════════════════════
 if "scheduler_started" not in st.session_state:
     st.session_state.scheduler_started = True
-    thread = threading.Thread(target=test_scheduler, daemon=True)
-    thread.start()
-    print("[INFO] Test scheduler started! Will run every hour.")
+    # ✅ Only start scheduler if DISABLE_SCHEDULER is NOT set
+    if not os.getenv("DISABLE_SCHEDULER"):
+        thread = threading.Thread(target=test_scheduler, daemon=True)
+        thread.start()
+        print("[INFO] Test scheduler started! Will run every hour.")
+    else:
+        print("[INFO] Test scheduler DISABLED via DISABLE_SCHEDULER env var")
 
 # ── Premium Black CSS ─────────────────────────
 st.markdown("""
