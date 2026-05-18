@@ -3,6 +3,7 @@ settings.py — Settings Page
 CV upload + Job preferences + API keys check
 """
 import os
+from datetime import datetime
 import streamlit as st
 from utils.streamlit_helpers import show_notification
 from utils.cv_storage import extract_text_from_upload, save_cv_to_firestore
@@ -14,7 +15,7 @@ def render(db):
     tab1, tab2, tab3 = st.tabs(["📄 CV Upload", "🎯 Job Preferences", "🔑 API Keys"])
 
     # ══════════════════════
-    #  TAB 1 — CV Upload
+    #  TAB 1 — CV Upload (UPDATED: Saves to BOTH collections)
     # ══════════════════════
     with tab1:
         st.subheader("Apna CV Upload Karo")
@@ -24,6 +25,10 @@ def render(db):
         if st.session_state.get("cv_uploaded"):
             st.success(f"✅ CV uploaded: {st.session_state.get('cv_filename', 'CV')}")
             st.caption(f"Characters: {len(st.session_state.get('cv_text', ''))}")
+            
+            # Show where it's saved
+            st.info("📁 CV saved to Firebase collections: `users` AND `user_profiles`")
+            
             if st.button("🔄 New CV Upload Karo"):
                 st.session_state.cv_uploaded = False
                 st.rerun()
@@ -43,20 +48,30 @@ def render(db):
                     st.session_state.cv_filename = uploaded_file.name
                     st.session_state.user_id     = "user_001"  # MVP: single user
 
-                    # Firestore mein save karo (free — text as string)
                     if db:
-                        saved = save_cv_to_firestore(
-                            db,
-                            st.session_state.user_id,
-                            cv_text,
-                            uploaded_file.name
-                        )
-                        if saved:
-                            st.success("✅ CV uploaded aur Firebase mein save ho gaya!")
-                        else:
-                            st.warning("CV session mein save hua, Firebase error")
+                        # ✅ Save to users collection (existing)
+                        user_ref = db.collection("users").document(st.session_state.user_id)
+                        user_ref.set({
+                            "cv_text": cv_text,
+                            "cv_filename": uploaded_file.name,
+                            "cv_updated_at": datetime.utcnow().isoformat(),
+                            "cv_length": len(cv_text),
+                        }, merge=True)
+                        
+                        # ✅ ALSO save to user_profiles for agent compatibility
+                        profile_ref = db.collection("user_profiles").document(st.session_state.user_id)
+                        profile_ref.set({
+                            "cv_text": cv_text,
+                            "name": st.session_state.get("user_name", "Hassan Afzal"),
+                            "cv_filename": uploaded_file.name,
+                            "uploaded_at": datetime.utcnow().isoformat(),
+                            "cv_length": len(cv_text),
+                        }, merge=True)
+                        
+                        st.success("✅ CV saved to BOTH collections (users + user_profiles)!")
+                        st.info("🤖 Agent can now detect your CV in the next cycle.")
                     else:
-                        st.success("✅ CV session mein save ho gaya!")
+                        st.warning("⚠️ CV saved to session only (Firebase not connected)")
 
                     with st.expander("CV Preview"):
                         st.text(cv_text[:800] + ("..." if len(cv_text) > 800 else ""))
@@ -124,9 +139,10 @@ def render(db):
             st.session_state.min_match_score = min_match
             st.session_state.daily_app_limit = daily_limit
 
-            # Firebase mein save
+            # Firebase mein save (both collections)
             if db and st.session_state.get("user_id"):
                 try:
+                    # Save to users collection
                     db.collection("users").document(
                         st.session_state.user_id
                     ).set({
@@ -136,8 +152,20 @@ def render(db):
                             "work_type":    work_type,
                             "min_match":    min_match,
                             "daily_limit":  daily_limit,
-                        }
+                        },
+                        "updated_at": datetime.utcnow().isoformat()
                     }, merge=True)
+                    
+                    # Also save to user_profiles for agent
+                    db.collection("user_profiles").document(
+                        st.session_state.user_id
+                    ).set({
+                        "target_roles": target_roles,
+                        "locations": locations,
+                        "work_type": work_type,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }, merge=True)
+                    
                 except Exception as e:
                     st.warning(f"Firebase save error: {e}")
 
@@ -151,7 +179,6 @@ def render(db):
         st.subheader("API Keys Status")
         st.caption("Yeh sab .env mein honi chahiye")
 
-        # Required now
         required_keys = {
             "GEMINI_API_KEY":   "Gemini AI (LLM)",
             "TINYFISH_API_KEY": "TinyFish (Job Scraping)",
@@ -160,6 +187,7 @@ def render(db):
             "GMAIL_ADDRESS":     "Gmail Address",
             "GMAIL_APP_PASSWORD":"Gmail App Password",
             "TELEGRAM_BOT_TOKEN":"Telegram Bot",
+            "GROQ_API_KEY":      "Groq API (faster alternative)",
         }
 
         st.caption("**Required (abhi chahiye)**")
@@ -170,16 +198,27 @@ def render(db):
             else:
                 st.error(f"❌ {label} — .env mein add karo")
 
-        st.caption("**Optional (Phase 3 mein add karna)**")
+        st.caption("**Optional**")
         for env_key, label in optional_keys.items():
             val = os.getenv(env_key, "")
             if val and "your_" not in val:
                 st.success(f"✅ {label}")
             else:
-                st.warning(f"⏳ {label} — baad mein chahiye hogi")
+                st.warning(f"⏳ {label} — optional, add for more features")
 
         st.divider()
-        if db:
-            st.success("✅ Firebase Firestore — Connected")
-        else:
-            st.error("❌ Firebase — serviceAccountKey.json check karo")
+        
+        # Firebase Connection Status
+        col1, col2 = st.columns(2)
+        with col1:
+            if db:
+                st.success("✅ Firebase Firestore — Connected")
+            else:
+                st.error("❌ Firebase — Check credentials")
+        
+        with col2:
+            # Show where CV is stored
+            if st.session_state.get("cv_uploaded"):
+                st.info("📄 CV Status: Uploaded & Saved to Both Collections")
+            else:
+                st.warning("📄 CV Status: Not Uploaded Yet")
