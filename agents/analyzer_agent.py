@@ -1,12 +1,12 @@
 """
 agents/analyzer_agent.py — Analyzer Agent
 ==========================================
-CV vs Job Description matching using Gemini + ChromaDB
+CV vs Job Description matching using Groq API (primary) + Gemini (fallback)
 
 What it does:
   1. Reads CV from Firestore (user's uploaded CV)
   2. Fetches job from Firebase
-  3. Compares using Gemini (intelligent matching)
+  3. Compares using LLM (intelligent matching)
   4. Returns: match_score, matched_skills, missing_skills, free_courses
 """
 
@@ -16,27 +16,45 @@ import logging
 import re
 from typing import Dict, List, Optional, Tuple
 
-import google.generativeai as genai
 import streamlit as st
+
+# Initialize API preferences
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+USE_GROQ = bool(GROQ_API_KEY)  # Prefer Groq if available
+
+# Only import Gemini if needed (saves memory)
+if not USE_GROQ and GEMINI_API_KEY:
+    import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 
 
 class AnalyzerAgent:
     """
-    CV vs JD matching agent using Gemini Flash 2.0
+    CV vs JD matching agent using Groq (primary) or Gemini (fallback)
     """
     
-    def __init__(self, gemini_api_key: str = None):
-        if gemini_api_key:
-            genai.configure(api_key=gemini_api_key)
-        elif os.getenv("GEMINI_API_KEY"):
-            genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        else:
-            st.error("GEMINI_API_KEY not found!")
-            
-        self.model = genai.GenerativeModel("gemini-2.0-flash")
+    def __init__(self, api_key: str = None):
+        self.use_groq = USE_GROQ
         
+        if self.use_groq:
+            # Initialize Groq client
+            from groq import Groq
+            self.groq_client = Groq(api_key=GROQ_API_KEY)
+            self.model = "llama-3.3-70b-versatile"  # Best for analysis
+            logger.info("AnalyzerAgent using Groq API")
+            
+        elif GEMINI_API_KEY or api_key:
+            # Initialize Gemini as fallback
+            genai.configure(api_key=api_key or GEMINI_API_KEY)
+            self.gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+            logger.info("AnalyzerAgent using Gemini API (fallback)")
+            
+        else:
+            st.error("Neither GROQ_API_KEY nor GEMINI_API_KEY found!")
+            self.use_groq = False
+            
     # ═══════════════════════════════════════════════════════════
     #  MAIN METHOD — CV vs JD Comparison
     # ═══════════════════════════════════════════════════════════
@@ -67,21 +85,46 @@ class AnalyzerAgent:
         prompt = self._build_analysis_prompt(cv_text, jd_text, job_title, company_name)
         
         try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": 0.2,
-                    "max_output_tokens": 2048,
-                }
-            )
-            
-            result = self._parse_response(response.text)
+            if self.use_groq:
+                response_text = self._call_groq(prompt)
+            else:
+                response_text = self._call_gemini(prompt)
+                
+            result = self._parse_response(response_text)
             return result
             
         except Exception as e:
-            logger.error(f"Gemini analysis error: {e}")
+            logger.error(f"LLM analysis error: {e}")
             # Fallback — basic keyword matching
             return self._fallback_analysis(cv_text, jd_text)
+    
+    def _call_groq(self, prompt: str) -> str:
+        """Call Groq API with the prompt"""
+        try:
+            response = self.groq_client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a strict ATS analyzer. Return ONLY valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1000,
+                temperature=0.2
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Groq API error: {e}")
+            raise
+    
+    def _call_gemini(self, prompt: str) -> str:
+        """Call Gemini API with the prompt"""
+        response = self.gemini_model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.2,
+                "max_output_tokens": 1000,
+            }
+        )
+        return response.text
     
     # ═══════════════════════════════════════════════════════════
     #  BATCH ANALYSIS — Multiple Jobs
@@ -94,7 +137,7 @@ class AnalyzerAgent:
         progress_callback=None
     ) -> List[Dict]:
         """
-        Ek CV ko multiple jobs ke saath compare karo
+        Compare one CV with multiple jobs
         """
         analyzed_jobs = []
         total = len(jobs)
@@ -124,7 +167,7 @@ class AnalyzerAgent:
             
             analyzed_jobs.append(job)
             
-        # Sort by match score
+        # Sort by match score (highest first)
         return sorted(analyzed_jobs, key=lambda x: x.get("match_score", 0), reverse=True)
     
     # ═══════════════════════════════════════════════════════════
@@ -133,7 +176,7 @@ class AnalyzerAgent:
     
     def get_skill_gap_roadmap(self, missing_skills: List[str]) -> List[Dict]:
         """
-        Missing skills ke liye free courses suggest karo
+        Suggest free courses for missing skills
         """
         if not missing_skills:
             return []
@@ -155,23 +198,27 @@ class AnalyzerAgent:
         """
         
         try:
-            response = self.model.generate_content(prompt, generation_config={"temperature": 0.3})
+            if self.use_groq:
+                response_text = self._call_groq(prompt)
+            else:
+                response_text = self._call_gemini(prompt)
+                
             # Extract JSON from response
-            text = response.text
-            json_match = re.search(r'\[[\s\S]*\]', text)
+            json_match = re.search(r'\[[\s\S]*\]', response_text)
             if json_match:
                 return json.loads(json_match.group())
         except Exception as e:
             logger.warning(f"Skill gap roadmap error: {e}")
             
-        return [{"skill": s, "resource": f"Search YouTube/Coursera for {s} tutorials", "estimated_hours": 5} for s in missing_skills[:3]]
+        # Fallback suggestions
+        return [{"skill": s, "resource": f"Search YouTube/Coursera for {s} tutorials", "platform": "Various", "estimated_hours": 5} for s in missing_skills[:3]]
     
     # ═══════════════════════════════════════════════════════════
     #  PRIVATE HELPERS
     # ═══════════════════════════════════════════════════════════
     
     def _build_analysis_prompt(self, cv_text: str, jd_text: str, job_title: str, company_name: str) -> str:
-        """Strict ATS scoring prompt — realistic scores"""
+        """Strict ATS scoring prompt — realistic scores for fresh graduates"""
         
         # Truncate to avoid token limits
         cv_preview = cv_text[:2000] if cv_text else "No CV uploaded"
@@ -190,7 +237,7 @@ Company: {company_name}
 
 === STRICT SCORING RULES (FOLLOW CAREFULLY) ===
 
-Score 90-100: PERFECT MATCH (VERY RARE)
+Score 90-100: PERFECT MATCH (VERY RARE - almost impossible for fresh grads)
 - Candidate has EVERY required skill
 - Experience years match EXACTLY
 - Same industry/domain experience
@@ -221,44 +268,48 @@ REMEMBER:
 - Be HONEST and STRICT
 
 === OUTPUT ===
-Return ONLY JSON (no explanations):
+Return ONLY JSON (no explanations, no markdown):
 {{
     "match_score": <integer 40-75 typical for fresh grad>,
-    "matched_skills": ["skill1", "skill2"],
-    "missing_skills": ["skill1", "skill2"],
-    "recommendation": "<specific advice to improve match>",
+    "matched_skills": ["skill1", "skill2", "skill3"],
+    "missing_skills": ["skill1", "skill2", "skill3"],
+    "recommendation": "<specific advice to improve match, 1-2 sentences>",
     "quick_analysis": "<1-line honest summary>"
 }}
 """
     
     def _parse_response(self, response_text: str) -> Dict:
-        """Parse Gemini response and extract JSON"""
+        """Parse LLM response and extract JSON"""
         try:
+            # Remove markdown code blocks if present
+            response_text = re.sub(r'```json\s*', '', response_text)
+            response_text = re.sub(r'```\s*', '', response_text)
+            
             # Find JSON in response
             json_match = re.search(r'\{[\s\S]*\}', response_text)
             if json_match:
                 result = json.loads(json_match.group())
                 # Ensure all fields exist
                 return {
-                    "match_score": result.get("match_score", 50),
-                    "matched_skills": result.get("matched_skills", []),
-                    "missing_skills": result.get("missing_skills", []),
-                    "recommendation": result.get("recommendation", "Consider highlighting relevant skills."),
+                    "match_score": min(100, max(0, result.get("match_score", 50))),  # Clamp 0-100
+                    "matched_skills": result.get("matched_skills", [])[:15],  # Limit to 15 skills
+                    "missing_skills": result.get("missing_skills", [])[:15],
+                    "recommendation": result.get("recommendation", "Consider highlighting relevant skills in your CV."),
                     "quick_analysis": result.get("quick_analysis", "Review the detailed analysis above."),
                     "free_courses": result.get("free_courses", [])
                 }
         except Exception as e:
-            logger.warning(f"Parse error: {e}")
+            logger.warning(f"Parse error: {e}, Response: {response_text[:200]}")
             
         return self._default_analysis()
     
     def _default_analysis(self) -> Dict:
-        """Fallback analysis when Gemini fails"""
+        """Fallback analysis when LLM fails"""
         return {
             "match_score": 50,
             "matched_skills": [],
             "missing_skills": [],
-            "recommendation": "Please try again or check API key.",
+            "recommendation": "Please try again or check API configuration.",
             "quick_analysis": "Analysis temporarily unavailable.",
             "free_courses": []
         }
@@ -268,10 +319,12 @@ Return ONLY JSON (no explanations):
         cv_lower = cv_text.lower() if cv_text else ""
         jd_lower = jd_text.lower() if jd_text else ""
         
-        # Common tech skills
+        # Common tech skills (expanded list)
         skills = ["python", "java", "javascript", "react", "angular", "vue", "node", "django", 
-                  "flask", "fastapi", "aws", "azure", "docker", "kubernetes", "sql", "mongodb",
-                  "tensorflow", "pytorch", "machine learning", "ai", "data science"]
+                  "flask", "fastapi", "aws", "azure", "gcp", "docker", "kubernetes", "sql", "mongodb",
+                  "postgresql", "tensorflow", "pytorch", "machine learning", "deep learning", "ai", 
+                  "data science", "pandas", "numpy", "scikit-learn", "git", "linux", "rest api",
+                  "html", "css", "typescript", "nextjs", "spring boot", "c++", "c#", "php"]
         
         matched = []
         for skill in skills:
@@ -290,14 +343,19 @@ Return ONLY JSON (no explanations):
             score = 85
         else:
             # Max 75 for fresh grads with partial matches
-            score = min(75, int((len(matched) / (len(missing) + len(matched))) * 75))
+            ratio = len(matched) / (len(missing) + len(matched))
+            score = min(75, int(ratio * 75))
+        
+        # Add 10 points if CV is not empty (basic effort)
+        if cv_text and len(cv_text) > 500:
+            score = min(75, score + 10)
         
         return {
             "match_score": score,
             "matched_skills": matched[:10],
             "missing_skills": missing[:10],
-            "recommendation": f"Add {', '.join(missing[:3])} to your CV if possible." if missing else "Great match!",
-            "quick_analysis": f"Matched {len(matched)} skills, missing {len(missing)}",
+            "recommendation": f"Add {', '.join(missing[:3])} to your CV if possible." if missing else "Great match! Keep building your skills.",
+            "quick_analysis": f"Matched {len(matched)} skills, missing {len(missing)}. {'Good foundation!' if score > 50 else 'Focus on skill development.'}",
             "free_courses": []
         }
 
@@ -308,17 +366,17 @@ Return ONLY JSON (no explanations):
 
 def analyze_jobs_in_session(db, analyzer: AnalyzerAgent):
     """
-    Session mein stored jobs ko analyze karo aur save karo
+    Analyze jobs stored in session and save results
     """
     jobs = st.session_state.get("jobs_list", [])
     cv_text = st.session_state.get("cv_text", "")
     
     if not cv_text:
-        st.warning("⚠️ Pehle CV upload karo — Settings mein jao")
+        st.warning("⚠️ Please upload your CV first — Go to Settings")
         return False
         
     if not jobs:
-        st.warning("⚠️ Pehle Jobs Dhundo button dabao")
+        st.warning("⚠️ Please search for jobs first — Click 'Find Jobs' button")
         return False
     
     progress_bar = st.progress(0, text="Analyzing jobs...")
@@ -337,24 +395,43 @@ def analyze_jobs_in_session(db, analyzer: AnalyzerAgent):
         
         # Update session
         st.session_state.jobs_list = analyzed
+        st.session_state.analysis_complete = True
         
-        # Save to Firebase
+        # Save to Firebase if available
         if db:
             for job in analyzed:
                 try:
-                    db.collection("jobs").document(job["id"]).set({
-                        "match_score": job.get("match_score", 0),
-                        "matched_skills": job.get("matched_skills", []),
-                        "missing_skills": job.get("missing_skills", []),
-                        "recommendation": job.get("recommendation", ""),
-                        "analyzed_at": __import__('datetime').datetime.utcnow().isoformat()
-                    }, merge=True)
+                    job_id = job.get("id") or job.get("job_id")
+                    if job_id:
+                        db.collection("jobs").document(str(job_id)).set({
+                            "match_score": job.get("match_score", 0),
+                            "matched_skills": job.get("matched_skills", []),
+                            "missing_skills": job.get("missing_skills", []),
+                            "recommendation": job.get("recommendation", ""),
+                            "analyzed_at": __import__('datetime').datetime.utcnow().isoformat()
+                        }, merge=True)
                 except Exception as e:
                     logger.warning(f"Save analysis error: {e}")
         
         progress_bar.progress(100, text=f"✅ Analyzed {len(analyzed)} jobs!")
+        status_text.success(f"✅ Analysis complete! Found {len([j for j in analyzed if j.get('match_score', 0) >= 70])} high-match jobs.")
         return True
         
     except Exception as e:
         st.error(f"Analysis error: {e}")
+        logger.error(f"Batch analysis error: {e}")
         return False
+
+
+# ═══════════════════════════════════════════════════════════
+#  UTILITY FUNCTIONS
+# ═══════════════════════════════════════════════════════════
+
+def get_analyzer_status() -> Dict:
+    """Get current analyzer configuration status"""
+    return {
+        "using_groq": USE_GROQ,
+        "groq_available": bool(GROQ_API_KEY),
+        "gemini_available": bool(GEMINI_API_KEY),
+        "model": "llama-3.3-70b-versatile" if USE_GROQ else "gemini-2.0-flash"
+    }
