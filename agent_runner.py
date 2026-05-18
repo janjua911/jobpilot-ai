@@ -368,7 +368,7 @@ def optimize_and_apply(db, job, cv_text, profile):
         from agents.optimizer_agent import OptimizerAgent
 
         optimizer = OptimizerAgent()
-        result    = optimize_cv_for_job(
+        result    = optimizer.optimize_cv_for_job(
             cv_text      = cv_text,
             jd_text      = job.get("description", "")[:3000],
             job_title    = job.get("title", ""),
