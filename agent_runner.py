@@ -5,10 +5,10 @@ Yeh file Streamlit se BILKUL alag hai.
 Railway pe 24/7 chalti hai.
 
 FIXES:
-  1. Dedup logic: company name → unique job_id + 7-day time window
-     (Pehle sab "already processed" dikh raha tha)
+  1. Dedup logic: company name → unique job_id + time window
   2. Telegram 409: deleteWebhook call before polling starts
   3. CYCLE_HOURS default 6 → env var se sahi padh raha hai
+  4. OPTIMIZER SKIP: agar email nahi mila toh optimizer mat chalao
 """
 
 import os
@@ -36,7 +36,7 @@ CYCLE_HOURS           = int(os.getenv("AGENT_CYCLE_HOURS", "6"))
 AUTO_APPLY_THRESHOLD  = int(os.getenv("AUTO_APPLY_SCORE", "75"))
 ASK_THRESHOLD         = int(os.getenv("ASK_SCORE", "55"))
 
-# ✅ FIX: How many days before we re-process the same job
+# How many days before we re-process the same job
 REPROCESS_AFTER_DAYS  = int(os.getenv("REPROCESS_AFTER_DAYS", "7"))
 
 print("=" * 50)
@@ -109,7 +109,6 @@ def answer_callback(callback_id, text="✅"):
         print(f"   [DEBUG] Callback answer failed: {e}")
 
 
-# ✅ FIX: Delete any existing webhook before polling starts
 def delete_telegram_webhook():
     """
     Telegram 409 fix: Agar koi webhook set tha, usse hata do.
@@ -235,7 +234,6 @@ def mark_job_status(db, job_id, status):
         log.error(f"Status update error: {e}")
 
 
-# ✅ FIX: Proper dedup — uses job_id + time window, NOT company name
 def is_already_processed(db, job) -> bool:
     """
     Check karo agar yeh job pehle SUCCESSFULLY process ho chuki hai.
@@ -244,23 +242,21 @@ def is_already_processed(db, job) -> bool:
       - "applied"          → email ja chuka, dobara mat bhejo
       - "skipped_by_user"  → Hassan ne manually skip kiya
 
-    RE-PROCESS in sab pe (pehle broken cycle mein save hue the):
+    RE-PROCESS in sab pe:
       - "analyzed"          → Groq key missing thi, score 0 tha
       - "skipped_low_match" → Galat score se skip hua
       - ""  / missing       → Incomplete save
-      - koi bhi aur status  → Safe side pe re-process
     """
-    # Terminal statuses — in pe KABHI dobara apply mat karo
     TERMINAL = {"applied", "skipped_by_user"}
 
     try:
         job_id = str(job.get("id", "")).strip()
         if not job_id:
-            return False  # No ID → always process
+            return False
 
         doc = db.collection("jobs").document(job_id).get()
         if not doc.exists:
-            return False  # Naya job
+            return False
 
         status = doc.to_dict().get("status", "")
 
@@ -268,7 +264,6 @@ def is_already_processed(db, job) -> bool:
             log.info(f"  ⏭️ Skipping (status={status}): {job.get('company')} — {job.get('title', '')[:40]}")
             return True
 
-        # "analyzed", "skipped_low_match", "" → re-process karo
         return False
 
     except Exception as e:
@@ -363,48 +358,75 @@ def analyze_job(job, cv_text):
         return {"match_score": 0, "matched_skills": [], "missing_skills": []}
 
 
+# ═══════════════════════════════════════════════════════════════
+# ✅ FIXED: optimize_and_apply() — SKIP optimizer if no email found
+# ═══════════════════════════════════════════════════════════════
 def optimize_and_apply(db, job, cv_text, profile):
+    """
+    Optimizer + Apply Agent: CV tailor karo aur apply karo.
+    
+    ✅ FIX: Agar job mein apply email nahi mila toh optimizer skip karo.
+    Kyunki 90% jobs mein email nahi hota aur optimizer bekar resources use karta hai.
+    """
     try:
+        # Pehle check karo email hai ya nahi
+        apply_email = detect_apply_email(job)
+        
+        if not apply_email:
+            # Email nahi mila — optimizer mat chalao, seedha manual message
+            log.info(f"  📧 No email found for {job.get('company')} — sending manual instruction")
+            send_telegram(
+                f"📋 <b>Apply manually (no email found)</b>\n\n"
+                f"🏢 {job.get('company')}\n"
+                f"💼 {job.get('title')}\n"
+                f"📊 Match: {job.get('match_score')}%\n"
+                f"🔗 {job.get('apply_url', 'No URL')}\n\n"
+                f"💡 CV is ready — please fill the form manually"
+            )
+            
+            # Save to applications as manual_required
+            save_application(db, {
+                "job_id":       job.get("id"),
+                "company":      job.get("company"),
+                "title":        job.get("title"),
+                "match_score":  job.get("match_score", 0),
+                "apply_method": "manual_required",
+                "status":       "manual_required",
+                "cover_letter": "No email found for auto-application"
+            })
+            return False
+        
+        # ✅ Email mil gaya — ab optimizer chalao
+        log.info(f"  📧 Email found: {apply_email} — generating application...")
+        
         from agents.optimizer_agent import OptimizerAgent
 
         optimizer = OptimizerAgent()
-        result    = optimizer.optimize_cv_for_job(
-            cv_text      = cv_text,
-            jd_text      = job.get("description", "")[:3000],
-            job_title    = job.get("title", ""),
-            company_name = job.get("company", "")
+        result = optimizer.optimize_cv_for_job(
+            cv_text        = cv_text,
+            jd_text        = job.get("description", "")[:3000],
+            job_title      = job.get("title", ""),
+            company_name   = job.get("company", ""),
+            candidate_name = profile.get("name", "Hassan Afzal")
         )
 
         cover_letter = result.get("cover_letter", "Please find my application attached.")
-        apply_email  = detect_apply_email(job)
 
-        if apply_email:
-            success      = send_application_email(
-                to_email     = apply_email,
-                job          = job,
-                cover_letter = cover_letter,
-                cv_text      = cv_text,
-                name         = profile.get("name", "Hassan Afzal")
-            )
-            apply_method = f"email → {apply_email}"
-        else:
-            send_telegram(
-                f"📋 <b>Apply karna hai (manual)</b>\n\n"
-                f"🏢 {job.get('company')}\n"
-                f"💼 {job.get('title')}\n"
-                f"🔗 {job.get('apply_url', 'No URL')}\n\n"
-                f"CV ready hai — form manually bharo"
-            )
-            success      = False
-            apply_method = "manual_required"
+        success = send_application_email(
+            to_email     = apply_email,
+            job          = job,
+            cover_letter = cover_letter,
+            cv_text      = cv_text,
+            name         = profile.get("name", "Hassan Afzal")
+        )
 
         save_application(db, {
             "job_id":       job.get("id"),
             "company":      job.get("company"),
             "title":        job.get("title"),
             "match_score":  job.get("match_score", 0),
-            "apply_method": apply_method,
-            "status":       "applied" if success else "manual_required",
+            "apply_method": f"email → {apply_email}",
+            "status":       "applied" if success else "apply_failed",
             "cover_letter": cover_letter[:500]
         })
 
@@ -452,16 +474,18 @@ def run_agent_cycle(db):
     needs_approval = []
     low_match      = 0
     skipped        = 0
+    manual_required = 0
 
     for job in jobs:
-        # ✅ FIX: Use new time-aware dedup
+        # Dedup check
         if is_already_processed(db, job):
             skipped += 1
             continue
 
+        # Analyze job
         analysis = analyze_job(job, cv_text)
-        time.sleep(2)
-        score    = analysis.get("match_score", 0)
+        time.sleep(2)  # Rate limit respect
+        score = analysis.get("match_score", 0)
 
         job["match_score"]    = score
         job["matched_skills"] = analysis.get("matched_skills", [])
@@ -469,9 +493,10 @@ def run_agent_cycle(db):
         job["status"]         = "analyzed"
 
         save_job(db, job)
-        log.info(f"  📊 {job.get('company')} — {job.get('title')} — {score}%")
+        log.info(f"  📊 {job.get('company')} — {job.get('title')[:40]} — {score}%")
 
         if score >= AUTO_APPLY_THRESHOLD:
+            log.info(f"  🚀 Auto-applying to {job.get('company')} (score: {score}%)")
             success = optimize_and_apply(db, job, cv_text, profile)
             if success:
                 auto_applied += 1
@@ -483,6 +508,9 @@ def run_agent_cycle(db):
                     f"🕐 {datetime.now().strftime('%H:%M')}"
                 )
                 mark_job_status(db, job.get("id"), "applied")
+            else:
+                # optimize_and_apply returned False (probably no email)
+                manual_required += 1
 
         elif score >= ASK_THRESHOLD:
             needs_approval.append(job)
@@ -508,14 +536,15 @@ def run_agent_cycle(db):
 
     log.info(
         f"✅ Cycle complete — "
-        f"Auto: {auto_applied} | Pending: {len(needs_approval)} | "
-        f"Low: {low_match} | Skipped(old): {skipped}"
+        f"Auto: {auto_applied} | Manual: {manual_required} | "
+        f"Pending: {len(needs_approval)} | Low: {low_match} | Skipped: {skipped}"
     )
 
-    if auto_applied > 0 or needs_approval:
+    if auto_applied > 0 or needs_approval or manual_required > 0:
         send_telegram(
             f"📊 <b>Cycle Complete</b>\n\n"
             f"✅ Auto Applied: {auto_applied}\n"
+            f"📋 Manual Required: {manual_required}\n"
             f"⏳ Approval Needed: {len(needs_approval)}\n"
             f"⏭️ Low Match: {low_match}\n"
             f"💤 Next cycle: {CYCLE_HOURS} hours"
@@ -552,17 +581,15 @@ def listen_telegram(db):
 
             if resp.status_code == 409:
                 consecutive_409 += 1
-                # Exponential backoff: 10s, 20s, 40s, 60s cap
                 wait = min(60, 10 * (2 ** (consecutive_409 - 1)))
                 log.warning(f"Telegram 409 conflict (#{consecutive_409}) — waiting {wait}s...")
                 time.sleep(wait)
                 if consecutive_409 >= 5:
-                    # Try deleting webhook again
                     delete_telegram_webhook()
                     consecutive_409 = 0
                 continue
 
-            consecutive_409 = 0  # Reset on success
+            consecutive_409 = 0
 
             if resp.status_code != 200:
                 print(f"[DEBUG] getUpdates returned {resp.status_code}")
@@ -588,7 +615,7 @@ def listen_telegram(db):
                     handle_approval(db, cb_data.replace("skip_", ""), approved=False)
 
         except requests.exceptions.Timeout:
-            pass  # Normal long-poll timeout — continue
+            pass
         except Exception as e:
             log.error(f"Telegram listener error: {e}")
             time.sleep(10)
@@ -634,7 +661,7 @@ if __name__ == "__main__":
         log.error(f"Firebase connection failed: {e}")
         exit(1)
 
-    # ✅ FIX: Delete webhook FIRST — prevents 409 conflict in listener
+    # ✅ FIX: Delete webhook FIRST — prevents 409 conflict
     print("[DEBUG] Deleting any existing Telegram webhook...")
     delete_telegram_webhook()
 
