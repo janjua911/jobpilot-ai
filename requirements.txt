@@ -20,6 +20,7 @@ firebase-admin==6.5.0
 # ── CV Generation ───────────────────────────
 python-docx==1.1.2
 reportlab==4.2.2          # PDF export ke liye
+pypdf
 
 # ── Web Scraping (TinyFish wrapper) ─────────
 requests==2.32.3
