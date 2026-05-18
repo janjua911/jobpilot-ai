@@ -238,51 +238,42 @@ def mark_job_status(db, job_id, status):
 # ✅ FIX: Proper dedup — uses job_id + time window, NOT company name
 def is_already_processed(db, job) -> bool:
     """
-    Check karo agar yeh job pehle process ho chuki hai.
+    Check karo agar yeh job pehle SUCCESSFULLY process ho chuki hai.
 
-    OLD logic (buggy):
-      - Company name check → same company ke multiple jobs miss hote the
-      - Koi time window nahi → jobs forever skip hoti thin
+    SKIP sirf in terminal statuses pe:
+      - "applied"          → email ja chuka, dobara mat bhejo
+      - "skipped_by_user"  → Hassan ne manually skip kiya
 
-    NEW logic:
-      - Unique job ID check karo
-      - Agar REPROCESS_AFTER_DAYS se pehle process hua → skip
-      - Warna → process karo (stale job ko fresh maano)
+    RE-PROCESS in sab pe (pehle broken cycle mein save hue the):
+      - "analyzed"          → Groq key missing thi, score 0 tha
+      - "skipped_low_match" → Galat score se skip hua
+      - ""  / missing       → Incomplete save
+      - koi bhi aur status  → Safe side pe re-process
     """
+    # Terminal statuses — in pe KABHI dobara apply mat karo
+    TERMINAL = {"applied", "skipped_by_user"}
+
     try:
-        job_id = str(job.get("id", ""))
-        if not job_id or job_id == "":
+        job_id = str(job.get("id", "")).strip()
+        if not job_id:
             return False  # No ID → always process
 
         doc = db.collection("jobs").document(job_id).get()
         if not doc.exists:
-            return False  # Naya job → process karo
+            return False  # Naya job
 
-        data   = doc.to_dict()
-        status = data.get("status", "")
+        status = doc.to_dict().get("status", "")
 
-        # Agar status nahi set → process karo
-        if not status:
-            return False
+        if status in TERMINAL:
+            log.info(f"  ⏭️ Skipping (status={status}): {job.get('company')} — {job.get('title', '')[:40]}")
+            return True
 
-        # ✅ Time window check: REPROCESS_AFTER_DAYS ke baad re-process karo
-        processed_at_str = data.get("updated_at", data.get("analyzed_at", ""))
-        if processed_at_str:
-            try:
-                processed_at = datetime.fromisoformat(processed_at_str)
-                age_days     = (datetime.now() - processed_at).days
-                if age_days >= REPROCESS_AFTER_DAYS:
-                    log.info(f"  🔄 Re-processing {job.get('company')} ({age_days} days old)")
-                    return False  # Stale → process again
-            except Exception:
-                pass  # Parse error → process karo (safe default)
-
-        log.info(f"  ⏭️ Already processed: {job.get('company')} — {job.get('title', '')[:40]}")
-        return True
+        # "analyzed", "skipped_low_match", "" → re-process karo
+        return False
 
     except Exception as e:
         log.warning(f"Dedup check error: {e}")
-        return False  # Error on check → process karo (safe default)
+        return False
 
 
 # ── Email Apply ───────────────────────────────────────────────
