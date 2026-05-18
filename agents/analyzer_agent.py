@@ -9,7 +9,7 @@ What it does:
   3. Compares using LLM (intelligent matching)
   4. Returns: match_score, matched_skills, missing_skills, free_courses
 """
-
+ 
 import os
 import json
 import logging
