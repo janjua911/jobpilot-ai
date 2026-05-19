@@ -9,6 +9,7 @@
 #   3. CYCLE_HOURS default 6 → env var se sahi padh raha hai
 #   4. OPTIMIZER SKIP: agar email nahi mila toh optimizer mat chalao
 #   5. ✅ Replace send_application_email() with ApplyAgent.apply()
+#   6. ✅ Handle result dict from apply_agent.apply() and save correctly
 
 import os
 import time
@@ -34,8 +35,6 @@ TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "")
 CYCLE_HOURS           = int(os.getenv("AGENT_CYCLE_HOURS", "6"))
 AUTO_APPLY_THRESHOLD  = int(os.getenv("AUTO_APPLY_SCORE", "75"))
 ASK_THRESHOLD         = int(os.getenv("ASK_SCORE", "55"))
-
-# How many days before we re-process the same job
 REPROCESS_AFTER_DAYS  = int(os.getenv("REPROCESS_AFTER_DAYS", "7"))
 
 print("=" * 50)
@@ -236,11 +235,9 @@ def mark_job_status(db, job_id, status):
 def is_already_processed(db, job) -> bool:
     """
     Check karo agar yeh job pehle SUCCESSFULLY process ho chuki hai.
-
     SKIP sirf in terminal statuses pe:
       - "applied"          → email ja chuka, dobara mat bhejo
       - "skipped_by_user"  → Hassan ne manually skip kiya
-
     RE-PROCESS in sab pe:
       - "analyzed"          → Groq key missing thi, score 0 tha
       - "skipped_low_match" → Galat score se skip hua
@@ -270,10 +267,7 @@ def is_already_processed(db, job) -> bool:
         return False
 
 
-# ── Email Apply ───────────────────────────────────────────────
-# ❌ OLD: send_application_email function removed
-# ✅ NEW: Use ApplyAgent.apply() instead
-
+# ── Email detection (still useful for optimizer skip) ─────────
 def detect_apply_email(job):
     description = job.get("description", "") + " " + job.get("apply_url", "")
     emails      = re.findall(r'[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}', description)
@@ -323,79 +317,65 @@ def analyze_job(job, cv_text):
 
 
 # ═══════════════════════════════════════════════════════════════
-# ✅ FIXED: Use ApplyAgent.apply() instead of send_application_email
+# ✅ FIXED: Use ApplyAgent.apply() and handle its result dict
 # ═══════════════════════════════════════════════════════════════
 def optimize_and_apply(db, job, cv_text, profile):
     """
     Optimizer + Apply Agent: CV tailor karo aur apply karo.
-    
-    ✅ FIX: Agar job mein apply email nahi mila toh optimizer skip karo.
-    ✅ FIX: Use ApplyAgent.apply() for application (replaces old email function)
+    ✅ Now handles the dict returned by ApplyAgent.apply().
     """
     try:
-        # Pehle check karo email hai ya nahi
+        # Check if we have an email (to decide if we need to run optimizer)
         apply_email = detect_apply_email(job)
-        
-        if not apply_email:
-            # Email nahi mila — optimizer mat chalao, seedha manual message
-            log.info(f"  📧 No email found for {job.get('company')} — sending manual instruction")
-            send_telegram(
-                f"📋 <b>Apply manually (no email found)</b>\n\n"
-                f"🏢 {job.get('company')}\n"
-                f"💼 {job.get('title')}\n"
-                f"📊 Match: {job.get('match_score')}%\n"
-                f"🔗 {job.get('apply_url', 'No URL')}\n\n"
-                f"💡 CV is ready — please fill the form manually"
+
+        # Prepare cover letter (either via optimizer or a simple fallback)
+        if apply_email:
+            log.info(f"  📧 Email found: {apply_email} — generating cover letter...")
+            from agents.optimizer_agent import OptimizerAgent
+            optimizer = OptimizerAgent()
+            result = optimizer.optimize_cv_for_job(
+                cv_text        = cv_text,
+                jd_text        = job.get("description", "")[:3000],
+                job_title      = job.get("title", ""),
+                company_name   = job.get("company", ""),
+                candidate_name = profile.get("name", "Hassan Afzal")
             )
-            
-            # Save to applications as manual_required
-            save_application(db, {
-                "job_id":       job.get("id"),
-                "company":      job.get("company"),
-                "title":        job.get("title"),
-                "match_score":  job.get("match_score", 0),
-                "apply_method": "manual_required",
-                "status":       "manual_required",
-                "cover_letter": "No email found for auto-application"
-            })
-            return False
-        
-        # ✅ Email mil gaya — ab optimizer chalao
-        log.info(f"  📧 Email found: {apply_email} — generating application...")
-        
-        from agents.optimizer_agent import OptimizerAgent
-        from agents.apply_agent import ApplyAgent   # ✅ NEW: import ApplyAgent
+            cover_letter = result.get("cover_letter", "Please find my application attached.")
+        else:
+            # No email, but we may still need a cover letter for apply_url fallback
+            cover_letter = f"Dear Hiring Manager,\n\nI am applying for the {job.get('title')} position at {job.get('company')}. My CV is attached.\n\nBest regards,\n{profile.get('name', 'Hassan Afzal')}"
 
-        optimizer = OptimizerAgent()
-        result = optimizer.optimize_cv_for_job(
-            cv_text        = cv_text,
-            jd_text        = job.get("description", "")[:3000],
-            job_title      = job.get("title", ""),
-            company_name   = job.get("company", ""),
-            candidate_name = profile.get("name", "Hassan Afzal")
-        )
-
-        cover_letter = result.get("cover_letter", "Please find my application attached.")
-        
-        # ✅ NEW: Use ApplyAgent.apply() instead of old send_application_email
+        # Import ApplyAgent and call apply()
+        from agents.apply_agent import ApplyAgent
         apply_agent = ApplyAgent()
-        success = apply_agent.apply(
+        result_dict = apply_agent.apply(
             job=job,
             cover_letter=cover_letter,
-            cv_bytes=cv_text.encode('utf-8')   # convert cv_text to bytes
+            cv_bytes=cv_text.encode('utf-8'),   # convert cv_text to bytes
+            candidate_name=profile.get("name", "Hassan Afzal")
         )
+
+        # Save application to Firebase (always save, even if manual link)
+        apply_method = result_dict.get("method", "unknown")
+        apply_status = "applied" if result_dict.get("success") and apply_method == "email" else \
+                       "manual_link_sent" if apply_method == "telegram_link" else \
+                       "manual_required" if apply_method == "telegram_manual_no_link" else \
+                       "apply_failed"
 
         save_application(db, {
             "job_id":       job.get("id"),
             "company":      job.get("company"),
             "title":        job.get("title"),
             "match_score":  job.get("match_score", 0),
-            "apply_method": f"email → {apply_email}",
-            "status":       "applied" if success else "apply_failed",
-            "cover_letter": cover_letter[:500]
+            "apply_method": apply_method,
+            "status":       apply_status,
+            "cover_letter": cover_letter[:500],
+            "apply_url":    result_dict.get("apply_url", job.get("apply_url")),
+            "message":      result_dict.get("message", "")
         })
 
-        return success
+        # Return boolean for the caller (used in auto-apply count)
+        return result_dict.get("success", False)
 
     except Exception as e:
         log.error(f"Optimizer/Apply error: {e}")
@@ -474,7 +454,7 @@ def run_agent_cycle(db):
                 )
                 mark_job_status(db, job.get("id"), "applied")
             else:
-                # optimize_and_apply returned False (probably no email)
+                # optimize_and_apply returned False — probably no email & no link
                 manual_required += 1
 
         elif score >= ASK_THRESHOLD:
@@ -516,13 +496,10 @@ def run_agent_cycle(db):
         )
 
 
-# ── Telegram Approval Listener ────────────────────────────────
+# ── Telegram Approval Listener (unchanged) ────────────────────
 def listen_telegram(db):
     """
     Hassan ke Yes/No replies sunna.
-
-    ✅ FIX: deleteWebhook already called before this thread starts.
-    409 error agar phir bhi aaye → longer backoff with exponential retry.
     """
     last_update_id    = 0
     consecutive_409   = 0
@@ -626,7 +603,7 @@ if __name__ == "__main__":
         log.error(f"Firebase connection failed: {e}")
         exit(1)
 
-    # ✅ FIX: Delete webhook FIRST — prevents 409 conflict
+    # Delete webhook FIRST — prevents 409 conflict
     print("[DEBUG] Deleting any existing Telegram webhook...")
     delete_telegram_webhook()
 
