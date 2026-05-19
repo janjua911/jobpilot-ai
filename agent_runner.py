@@ -10,7 +10,7 @@
 #   4. OPTIMIZER SKIP: agar email nahi mila toh optimizer mat chalao
 #   5. ✅ Replace send_application_email() with ApplyAgent.apply()
 #   6. ✅ Handle result dict from apply_agent.apply() and save correctly
-
+ 
 import os
 import time
 import logging
