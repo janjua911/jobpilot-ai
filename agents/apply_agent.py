@@ -2,7 +2,7 @@
 agents/apply_agent.py — Email Application Agent
 ================================================
 Sends job applications via Gmail SMTP
-Fallback: Telegram notification when no email found
+Fallback: When no email, send a direct apply link (apply_url) via Telegram.
 """
 
 import os
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
-# COMPANY EMAIL DATABASE
+# COMPANY EMAIL DATABASE (unchanged)
 # ─────────────────────────────────────────────────────────────
 COMPANY_EMAILS = {
     # Tech Giants
@@ -94,15 +94,15 @@ EMAIL_PATTERNS = ["careers", "jobs", "hr", "hiring", "recruiting", "talent"]
 
 
 # ─────────────────────────────────────────────────────────────
-# TELEGRAM HELPER
+# TELEGRAM HELPER (with inline keyboard support)
 # ─────────────────────────────────────────────────────────────
-def send_telegram_message(text: str, parse_mode: str = "HTML") -> bool:
-    """Send a message to Hassan on Telegram"""
+def send_telegram_message(text: str, parse_mode: str = "HTML", reply_markup: dict = None) -> bool:
+    """Send a message to Hassan on Telegram, optionally with inline buttons."""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
 
     if not bot_token or not chat_id:
-        logger.warning("Telegram not configured — cannot send fallback message")
+        logger.warning("Telegram not configured — cannot send message")
         return False
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -112,11 +112,13 @@ def send_telegram_message(text: str, parse_mode: str = "HTML") -> bool:
         "parse_mode": parse_mode,
         "disable_web_page_preview": False,
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
     try:
         resp = requests.post(url, json=payload, timeout=10)
         resp.raise_for_status()
-        logger.info("Telegram fallback message sent successfully")
+        logger.info("Telegram message sent successfully")
         return True
     except Exception as e:
         logger.error(f"Telegram send error: {e}")
@@ -131,13 +133,11 @@ def send_manual_apply_telegram(
     match_score: int = 0,
 ) -> bool:
     """
-    Send 'Manual Apply Needed' card to Telegram.
-    Cover letter is split into two messages if it's long,
-    because Telegram has a 4096-char limit.
+    Send 'Manual Apply Needed' card to Telegram (fallback when no email AND no apply_url).
+    Cover letter is split into two messages if long.
     """
     score_bar = "🟢" if match_score >= 75 else "🟡" if match_score >= 55 else "🔴"
 
-    # ── Main card ──────────────────────────────────────────────
     card = (
         f"📋 <b>Manual Apply Needed</b>\n"
         f"{'─' * 32}\n"
@@ -149,8 +149,7 @@ def send_manual_apply_telegram(
     )
     ok1 = send_telegram_message(card)
 
-    # ── Cover letter (separate message, truncated if needed) ────
-    MAX_CL = 3800  # safe under 4096
+    MAX_CL = 3800
     if len(cover_letter) > MAX_CL:
         cover_letter_trimmed = cover_letter[:MAX_CL] + "\n\n… <i>(truncated — full version in Firebase)</i>"
     else:
@@ -171,7 +170,7 @@ def send_manual_apply_telegram(
 # MAIN AGENT
 # ─────────────────────────────────────────────────────────────
 class ApplyAgent:
-    """Send job applications via email, with Telegram fallback"""
+    """Send job applications via email, with Telegram fallback using apply_url."""
 
     def __init__(self):
         self.sender_email = os.getenv("GMAIL_ADDRESS", "")
@@ -188,12 +187,13 @@ class ApplyAgent:
         """
         Smart apply:
           1. Try email (from job data / company DB)
-          2. If no email → Telegram manual-apply card
+          2. If email found → send via SMTP
+          3. Else try to extract apply_url → send Telegram with link + button
+          4. Else fallback to old manual instruction (no link)
         Returns a result dict with success, method, message.
         """
         company    = job.get("company", "Unknown Company")
         job_title  = job.get("title", "the position")
-        apply_url  = job.get("url", job.get("apply_url", "#"))
         match_score = job.get("match_score", 0)
 
         # ── 1. Resolve email ───────────────────────────────────
@@ -213,37 +213,111 @@ class ApplyAgent:
             result["to_email"] = to_email
             return result
 
-        # ── 3. No email → Telegram fallback ───────────────────
-        logger.info(f"No email for '{company}' — sending Telegram manual-apply card")
+        # ── 3. No email – try apply_url ─────────────────────────
+        apply_url = self._extract_apply_url(job)
+        if apply_url:
+            return self._notify_url_application(job, cover_letter, apply_url, match_score)
+
+        # ── 4. No email, no URL – old manual message ────────────
+        logger.info(f"No email or apply_url for '{company}' — sending old manual instruction")
         tg_ok = send_manual_apply_telegram(
             company=company,
             job_title=job_title,
-            apply_url=apply_url,
+            apply_url="#",
             cover_letter=cover_letter,
             match_score=match_score,
         )
-
         if tg_ok:
             return {
-                "success": True,          # treat as "handled" so it logs in Firebase
-                "method": "telegram_manual",
-                "message": (
-                    f"📋 No email found for {company}. "
-                    f"Manual apply card sent to Telegram with cover letter."
-                ),
+                "success": True,   # "handled" so it saves in Firebase
+                "method": "telegram_manual_no_link",
+                "message": f"📋 No email or link for {company}. Manual instruction sent.",
                 "sent_at": datetime.now().isoformat(),
-                "apply_url": apply_url,
             }
         else:
             return {
                 "success": False,
                 "method": "none",
-                "message": f"❌ No email for {company} and Telegram send failed. Apply manually: {apply_url}",
+                "message": f"❌ No contact method for {company} and Telegram failed.",
                 "sent_at": None,
-                "apply_url": apply_url,
             }
 
-    # ── Legacy method (kept for backward compatibility) ────────
+    # ── Helper to extract apply_url from job dict ──────────────
+    def _extract_apply_url(self, job: Dict) -> Optional[str]:
+        """
+        Extract a working application URL from various fields.
+        Returns the first valid http(s) URL found.
+        """
+        candidates = [
+            job.get("apply_url"),
+            job.get("redirect_url"),
+            job.get("url"),
+            job.get("application_link"),
+            job.get("company_url"),
+        ]
+        for url in candidates:
+            if url and isinstance(url, str) and url.startswith(("http://", "https://")):
+                return url
+
+        # Also try to find a link inside the description
+        desc = job.get("description", "")
+        if desc:
+            match = re.search(r'https?://[^\s<>"\'()]+', desc)
+            if match:
+                return match.group(0)
+
+        return None
+
+    # ── New: Send Telegram with clickable apply_url + button ────
+    def _notify_url_application(self, job: Dict, cover_letter: str, apply_url: str, match_score: int) -> Dict:
+        """
+        Send a Telegram message with a direct application link and an inline button.
+        Also saves the application to Firebase (caller must save).
+        """
+        company = job.get("company", "Unknown")
+        title = job.get("title", "Position")
+
+        # Build inline keyboard with one button
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "🔗 Apply Now", "url": apply_url}]
+            ]
+        }
+
+        message = (
+            f"🔗 <b>Apply using this link</b>\n"
+            f"{'─' * 32}\n"
+            f"🏢 {company}\n"
+            f"💼 {title}\n"
+            f"📊 Match: {match_score}%\n\n"
+            f"👉 <a href='{apply_url}'>Click here to open application form</a>\n\n"
+            f"⚠️ Auto-apply not possible – please complete the application manually.\n"
+            f"📝 Cover letter is ready below 👇"
+        )
+
+        send_telegram_message(message, reply_markup=keyboard)
+
+        # Send cover letter as a separate message (no button needed)
+        MAX_CL = 3800
+        if len(cover_letter) > MAX_CL:
+            cover_letter = cover_letter[:MAX_CL] + "\n\n… <i>(truncated)</i>"
+        cl_msg = (
+            f"✉️ <b>Cover Letter — {company}</b>\n"
+            f"{'─' * 32}\n"
+            f"{cover_letter}\n\n"
+            f"<i>Copy and paste when applying ☝️</i>"
+        )
+        send_telegram_message(cl_msg)
+
+        return {
+            "success": True,
+            "method": "telegram_link",
+            "message": f"🔗 Application link sent to Telegram for {company}",
+            "sent_at": datetime.now().isoformat(),
+            "apply_url": apply_url,
+        }
+
+    # ── Legacy email sending (unchanged) ────────────────────────
     def send_application(
         self,
         to_email: str,
@@ -253,8 +327,7 @@ class ApplyAgent:
         cover_letter_text: str,
         candidate_name: str = "Hassan Afzal",
     ) -> Dict:
-        """Send application email with CV attached"""
-
+        """Send application email with CV attached."""
         if not self.sender_email or not self.app_password:
             return {
                 "success": False,
@@ -271,16 +344,13 @@ class ApplyAgent:
 
         try:
             msg = MIMEMultipart()
-            msg["From"]    = self.sender_email
-            msg["To"]      = to_email
+            msg["From"] = self.sender_email
+            msg["To"] = to_email
             msg["Subject"] = f"Application for {job_title} — {candidate_name}"
 
-            body = self._build_email_body(
-                candidate_name, job_title, company_name, cover_letter_text
-            )
+            body = self._build_email_body(candidate_name, job_title, company_name, cover_letter_text)
             msg.attach(MIMEText(body, "plain"))
 
-            # Attach CV only if bytes provided
             if cv_bytes:
                 filename = f"{candidate_name.replace(' ', '_')}_{job_title.replace(' ', '_')}_CV.docx"
                 self._attach_file(msg, cv_bytes, filename)
@@ -303,9 +373,7 @@ class ApplyAgent:
                 "sent_at": None,
             }
 
-    def _build_email_body(
-        self, name: str, job_title: str, company: str, cover_letter: str
-    ) -> str:
+    def _build_email_body(self, name: str, job_title: str, company: str, cover_letter: str) -> str:
         return f"""Dear Hiring Manager,
 
 {cover_letter}
@@ -331,7 +399,7 @@ This application was sent via JobPilot AI
 
 
 # ─────────────────────────────────────────────────────────────
-# EMAIL LOOKUP HELPERS
+# EMAIL LOOKUP HELPERS (unchanged)
 # ─────────────────────────────────────────────────────────────
 def get_company_email_from_name(company_name: str) -> Optional[str]:
     if not company_name:
@@ -351,7 +419,7 @@ def get_company_email_from_name(company_name: str) -> Optional[str]:
         if key in COMPANY_EMAILS:
             return COMPANY_EMAILS[key]
 
-    # Generate educated guess (first pattern only)
+    # Generate educated guess
     if company_clean:
         return f"careers@{company_clean}.com"
 
