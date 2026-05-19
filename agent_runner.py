@@ -1,15 +1,14 @@
-"""
-agent_runner.py — JobPilot Autonomous Agent
-==========================================
-Yeh file Streamlit se BILKUL alag hai.
-Railway pe 24/7 chalti hai.
-
-FIXES:
-  1. Dedup logic: company name → unique job_id + time window
-  2. Telegram 409: deleteWebhook call before polling starts
-  3. CYCLE_HOURS default 6 → env var se sahi padh raha hai
-  4. OPTIMIZER SKIP: agar email nahi mila toh optimizer mat chalao
-"""
+# agent_runner.py — JobPilot Autonomous Agent
+# ==========================================
+# Yeh file Streamlit se BILKUL alag hai.
+# Railway pe 24/7 chalti hai.
+#
+# FIXES:
+#   1. Dedup logic: company name → unique job_id + time window
+#   2. Telegram 409: deleteWebhook call before polling starts
+#   3. CYCLE_HOURS default 6 → env var se sahi padh raha hai
+#   4. OPTIMIZER SKIP: agar email nahi mila toh optimizer mat chalao
+#   5. ✅ Replace send_application_email() with ApplyAgent.apply()
 
 import os
 import time
@@ -272,43 +271,8 @@ def is_already_processed(db, job) -> bool:
 
 
 # ── Email Apply ───────────────────────────────────────────────
-def send_application_email(to_email, job, cover_letter, cv_text, name):
-    import smtplib
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
-
-    gmail_user = os.getenv("GMAIL_ADDRESS", "")
-    gmail_pass = os.getenv("GMAIL_APP_PASSWORD", "")
-
-    if not gmail_user or not gmail_pass:
-        log.warning("Gmail not configured")
-        return False
-
-    try:
-        msg            = MIMEMultipart()
-        msg["From"]    = gmail_user
-        msg["To"]      = to_email
-        msg["Subject"] = f"Application for {job.get('title')} — {name}"
-
-        body = f"""{cover_letter}
-
----
-Candidate: {name}
-Applied via: JobPilot AI Agent
-"""
-        msg.attach(MIMEText(body, "plain"))
-
-        server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-        server.login(gmail_user, gmail_pass)
-        server.send_message(msg)
-        server.close()
-
-        log.info(f"📧 Email sent to {to_email}")
-        return True
-    except Exception as e:
-        log.error(f"Email error: {e}")
-        return False
-
+# ❌ OLD: send_application_email function removed
+# ✅ NEW: Use ApplyAgent.apply() instead
 
 def detect_apply_email(job):
     description = job.get("description", "") + " " + job.get("apply_url", "")
@@ -359,14 +323,14 @@ def analyze_job(job, cv_text):
 
 
 # ═══════════════════════════════════════════════════════════════
-# ✅ FIXED: optimize_and_apply() — SKIP optimizer if no email found
+# ✅ FIXED: Use ApplyAgent.apply() instead of send_application_email
 # ═══════════════════════════════════════════════════════════════
 def optimize_and_apply(db, job, cv_text, profile):
     """
     Optimizer + Apply Agent: CV tailor karo aur apply karo.
     
     ✅ FIX: Agar job mein apply email nahi mila toh optimizer skip karo.
-    Kyunki 90% jobs mein email nahi hota aur optimizer bekar resources use karta hai.
+    ✅ FIX: Use ApplyAgent.apply() for application (replaces old email function)
     """
     try:
         # Pehle check karo email hai ya nahi
@@ -400,6 +364,7 @@ def optimize_and_apply(db, job, cv_text, profile):
         log.info(f"  📧 Email found: {apply_email} — generating application...")
         
         from agents.optimizer_agent import OptimizerAgent
+        from agents.apply_agent import ApplyAgent   # ✅ NEW: import ApplyAgent
 
         optimizer = OptimizerAgent()
         result = optimizer.optimize_cv_for_job(
@@ -411,13 +376,13 @@ def optimize_and_apply(db, job, cv_text, profile):
         )
 
         cover_letter = result.get("cover_letter", "Please find my application attached.")
-
-        success = send_application_email(
-            to_email     = apply_email,
-            job          = job,
-            cover_letter = cover_letter,
-            cv_text      = cv_text,
-            name         = profile.get("name", "Hassan Afzal")
+        
+        # ✅ NEW: Use ApplyAgent.apply() instead of old send_application_email
+        apply_agent = ApplyAgent()
+        success = apply_agent.apply(
+            job=job,
+            cover_letter=cover_letter,
+            cv_bytes=cv_text.encode('utf-8')   # convert cv_text to bytes
         )
 
         save_application(db, {
